@@ -309,7 +309,7 @@ producer = KubernetesPodOperator(
         '--input-size-min-kb', '16', '--input-size-max-kb', '2048',
     ],
     container_resources=LIGHT_RESOURCES,
-    do_xcom_push=True,
+    do_xcom_push=False,  # TEMP diagnostic: isolating do_xcom_push as cause of stuck scheduling
     dag=dag,
     get_logs=True,
 )
