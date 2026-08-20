@@ -14,12 +14,9 @@ import math
 import multiprocessing
 import os
 import random
-import sys
 import time
 import uuid
 from datetime import datetime, timezone
-
-XCOM_PATH = "/airflow/xcom/return.json"
 
 
 def now_iso() -> str:
@@ -48,16 +45,6 @@ def detect_cpu_limit() -> int:
         pass
 
     return os.cpu_count() or 1
-
-
-def write_xcom(data: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(XCOM_PATH), exist_ok=True)
-        with open(XCOM_PATH, "w") as f:
-            json.dump(data, f)
-        print(f"[xcom] wrote result to {XCOM_PATH}", flush=True)
-    except OSError as e:
-        print(f"[xcom] could not write {XCOM_PATH} ({e}) -- skipping", flush=True)
 
 
 def cpu_burn_worker(target_percent: float, period: float, stop_event) -> None:
@@ -159,16 +146,19 @@ def run_producer(args) -> dict:
     return element
 
 
-def run_preprocessing(args, upstream: dict) -> dict:
+def run_preprocessing(args) -> dict:
     cores = args.cores or detect_cpu_limit()
     run_light_stage("preprocessing", args.light_cpu_percent, args.light_duration, cores, args.period)
-    element = dict(upstream)
-    element["preprocessed_at"] = now_iso()
+    element = {
+        "element_id": str(uuid.uuid4()),
+        "input_size_bytes": int(random.uniform(args.input_size_min_kb, args.input_size_max_kb) * 1024),
+        "preprocessed_at": now_iso(),
+    }
     print("[preprocessing] " + json.dumps(element), flush=True)
     return element
 
 
-def run_computation(args, upstream: dict) -> dict:
+def run_computation(args) -> dict:
     cores = args.cores or detect_cpu_limit()
 
     if args.profile:
@@ -191,19 +181,23 @@ def run_computation(args, upstream: dict) -> dict:
             mem_target = random.uniform(args.mem_min, args.mem_max)
         records.append(run_phase(i, cpu_target, mem_target, cores, phase_duration, args.period))
 
-    result = dict(upstream)
-    result["output_size_bytes"] = int(random.uniform(args.output_size_min_kb, args.output_size_max_kb) * 1024)
-    result["computed_at"] = now_iso()
-    result["phases"] = records
+    result = {
+        "element_id": str(uuid.uuid4()),
+        "output_size_bytes": int(random.uniform(args.output_size_min_kb, args.output_size_max_kb) * 1024),
+        "computed_at": now_iso(),
+        "phases": records,
+    }
     print("[computation] SUMMARY " + json.dumps(result), flush=True)
     return result
 
 
-def run_postprocessing(args, upstream: dict) -> dict:
+def run_postprocessing(args) -> dict:
     cores = args.cores or detect_cpu_limit()
     run_light_stage("postprocessing", args.light_cpu_percent, args.light_duration, cores, args.period)
-    result = dict(upstream)
-    result["postprocessed_at"] = now_iso()
+    result = {
+        "element_id": str(uuid.uuid4()),
+        "postprocessed_at": now_iso(),
+    }
     print("[postprocessing] FINAL " + json.dumps(result), flush=True)
     return result
 
@@ -211,8 +205,6 @@ def run_postprocessing(args, upstream: dict) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Synthetic pipeline stage: producer/preprocessing/computation/postprocessing")
     parser.add_argument("--stage", choices=["producer", "preprocessing", "computation", "postprocessing"], required=True)
-    parser.add_argument("--input-json", type=str, default=None,
-                         help="JSON string with upstream element metadata (from XCom)")
 
     parser.add_argument("--input-size-min-kb", type=float, default=16.0)
     parser.add_argument("--input-size-max-kb", type=float, default=2048.0)
@@ -244,24 +236,14 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
 
-    upstream = {}
-    if args.input_json:
-        try:
-            upstream = json.loads(args.input_json)
-        except json.JSONDecodeError as e:
-            print(f"[error] could not parse --input-json: {e}", file=sys.stderr)
-            sys.exit(1)
-
     if args.stage == "producer":
-        result = run_producer(args)
+        run_producer(args)
     elif args.stage == "preprocessing":
-        result = run_preprocessing(args, upstream)
+        run_preprocessing(args)
     elif args.stage == "computation":
-        result = run_computation(args, upstream)
+        run_computation(args)
     else:
-        result = run_postprocessing(args, upstream)
-
-    write_xcom(result)
+        run_postprocessing(args)
 
 
 if __name__ == "__main__":
@@ -309,7 +291,6 @@ producer = KubernetesPodOperator(
         '--input-size-min-kb', '16', '--input-size-max-kb', '2048',
     ],
     container_resources=LIGHT_RESOURCES,
-    do_xcom_push=False,  # TEMP diagnostic: isolating do_xcom_push as cause of stuck scheduling
     dag=dag,
     get_logs=True,
 )
@@ -322,12 +303,11 @@ preprocessing = KubernetesPodOperator(
     arguments=[
         SCRIPT_SOURCE,
         '--stage', 'preprocessing',
-        '--input-json', "{{ ti.xcom_pull(task_ids='producer_task') | tojson }}",
+        '--input-size-min-kb', '16', '--input-size-max-kb', '2048',
         '--light-cpu-percent', '30', '--light-duration', '5',
         '--cores', str(POD_CPU_LIMIT_CORES),
     ],
     container_resources=LIGHT_RESOURCES,
-    do_xcom_push=True,
     dag=dag,
     get_logs=True,
 )
@@ -340,7 +320,6 @@ computation = KubernetesPodOperator(
     arguments=[
         SCRIPT_SOURCE,
         '--stage', 'computation',
-        '--input-json', "{{ ti.xcom_pull(task_ids='preprocessing_task') | tojson }}",
         '--duration', '600', '--steps', '8',
         '--cpu-min', '10', '--cpu-max', '80',
         '--mem-min', '64', '--mem-max', '400',
@@ -348,7 +327,6 @@ computation = KubernetesPodOperator(
         '--cores', str(POD_CPU_LIMIT_CORES),
     ],
     container_resources=COMPUTATION_RESOURCES,
-    do_xcom_push=True,
     dag=dag,
     get_logs=True,
 )
@@ -361,12 +339,10 @@ postprocessing = KubernetesPodOperator(
     arguments=[
         SCRIPT_SOURCE,
         '--stage', 'postprocessing',
-        '--input-json', "{{ ti.xcom_pull(task_ids='computation_task') | tojson }}",
         '--light-cpu-percent', '30', '--light-duration', '5',
         '--cores', str(POD_CPU_LIMIT_CORES),
     ],
     container_resources=LIGHT_RESOURCES,
-    do_xcom_push=True,
     dag=dag,
     get_logs=True,
 )
