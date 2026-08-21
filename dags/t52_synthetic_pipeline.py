@@ -376,7 +376,7 @@ dag = DAG(
     't52_synthetic_pipeline_chain',
     default_args=default_args,
     description='Synthetic Producer->Preprocessing->Computation->Postprocessing pipeline for T5.2',
-    schedule='0 6,10,14,18 * * *',
+    schedule='0 */3 * * *',
     catchup=False,
     tags=['t52', 'synthetic', 'pipeline_predictor'],
 )
